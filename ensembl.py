@@ -2,31 +2,18 @@
 """
 ensembl.py
 
-Flask backend for Ensembl annotation with UniProt fallback support.
+Flask backend for Ensembl annotation with UniProt & NCBI fallback support.
 
-Features:
-- Primary data source: Ensembl REST API
-- Fallback data source: UniProt REST API (when Ensembl data is incomplete)
-- DOES NOT WRITE any files to disk (no TSV / gene_symbols.txt / go_ids.txt).
-- Exposes stable endpoints:
-    GET  /health      -> {"status":"ok","time":...}
-    GET  /version     -> {"version":"v1.0.0","started":...}
-    GET  /config      -> {"uniprot_fallback_enabled":true,"max_ids":200,...}
-    POST /annotate    -> accepts JSON {"id1":"ENSG...", "id2":"ENSG..."} or {"ids":["ENSG...", ...]}
-    GET  /annotate    -> fallback using query params ?id1=...&id2=...
-- Returns JSON only. The frontend should print the returned JSON (unchanged HTML works).
-- Limits requests for demo safety.
-- Automatic fallback to UniProt when Ensembl returns incomplete gene symbols or GO terms.
-
-Configuration:
-- Set ENABLE_UNIPROT_FALLBACK = True/False to enable/disable fallback
-- Adjust SLEEP_BETWEEN_UNIPROT for UniProt API rate limiting
-
-Run:
-    python ensembl.py
+Serves:
+  - GET  /health
+  - GET  /version
+  - GET  /config
+  - POST /annotate
+  - GET  /annotate
+  - GET  /           -> serves index.html from project root
+  - GET  /index.html -> serves index.html
 """
-
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import requests, time, sys, os, json
 from urllib.parse import quote
@@ -46,7 +33,7 @@ VERSION = "v1.0.0"
 ENABLE_UNIPROT_FALLBACK = True  # Enable/disable UniProt fallback
 ENABLE_NCBI_FALLBACK = True  # Enable/disable NCBI fallback
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder=None)
 CORS(app)  # allow cross-origin (safe for local dev)
 
 # ----- HTTP with retry/backoff -----
@@ -95,7 +82,10 @@ def get_gene_symbol(ensembl_id):
     r = retry_get(url)
     if r is None or r.status_code != 200:
         return None
-    j = r.json()
+    try:
+        j = r.json()
+    except Exception:
+        return None
     return j.get("display_name") or j.get("external_name") or None
 
 def get_go_xrefs(ensembl_id):
@@ -104,7 +94,10 @@ def get_go_xrefs(ensembl_id):
     r = retry_get(url)
     if r is None or r.status_code != 200:
         return []
-    items = r.json()
+    try:
+        items = r.json()
+    except Exception:
+        return []
     gos = []
     for it in items:
         dbname = (it.get("dbname") or "").upper()
@@ -122,14 +115,14 @@ def get_uniprot_id_from_ensembl(ensembl_id):
     """Map Ensembl gene ID to UniProt ID using direct search."""
     if not ENABLE_UNIPROT_FALLBACK:
         return None
-    
+
     # Try multiple search strategies
     search_queries = [
         f"database:ensembl AND {ensembl_id}",
         f"xref:ensembl-{ensembl_id}",
         f"gene:{ensembl_id}"
     ]
-    
+
     for query in search_queries:
         try:
             url = f"{UNIPROT_REST}/uniprotkb/search"
@@ -138,7 +131,7 @@ def get_uniprot_id_from_ensembl(ensembl_id):
                 "format": "json",
                 "size": 1
             }
-            
+
             time.sleep(SLEEP_BETWEEN_UNIPROT)
             r = retry_get(url, params=params)
             if r and r.status_code == 200:
@@ -154,10 +147,10 @@ def get_gene_symbol_from_uniprot(uniprot_id):
     """Get gene symbol from UniProt using UniProt ID."""
     if not ENABLE_UNIPROT_FALLBACK or not uniprot_id:
         return None
-    
+
     url = f"{UNIPROT_REST}/uniprotkb/{uniprot_id}"
     params = {"fields": "genes"}
-    
+
     try:
         time.sleep(SLEEP_BETWEEN_UNIPROT)
         r = retry_get(url, params=params)
@@ -165,7 +158,6 @@ def get_gene_symbol_from_uniprot(uniprot_id):
             data = r.json()
             genes = data.get("genes", [])
             if genes:
-                # Get the first gene name
                 gene = genes[0]
                 gene_name = gene.get("geneName", {}).get("value")
                 if gene_name:
@@ -178,38 +170,30 @@ def get_go_terms_from_uniprot(uniprot_id):
     """Get GO terms from UniProt using UniProt ID."""
     if not ENABLE_UNIPROT_FALLBACK or not uniprot_id:
         return []
-    
+
     try:
-        # Get full entry to access cross-references
         url = f"{UNIPROT_REST}/uniprotkb/{uniprot_id}"
-        
         time.sleep(SLEEP_BETWEEN_UNIPROT)
         r = retry_get(url)
         if r and r.status_code == 200:
             data = r.json()
-            
-            # Extract GO terms from cross-references
             gos = []
             cross_refs = data.get("uniProtKBCrossReferences", [])
-            
             for xref in cross_refs:
                 if xref.get("database") == "GO":
                     go_id = xref.get("id")
                     if go_id and go_id.startswith("GO:"):
-                        # Get description from properties
                         description = ""
                         properties = xref.get("properties", [])
                         for prop in properties:
                             if prop.get("key") == "GoTerm":
                                 description = prop.get("value", "")
                                 break
-                        
                         gos.append((go_id, description))
-            
             return gos
     except Exception:
         pass
-    
+
     return []
 
 # ----- NCBI Gene helpers -----
@@ -217,9 +201,8 @@ def get_ncbi_gene_id_from_ensembl(ensembl_id):
     """Map Ensembl gene ID to NCBI Gene ID using NCBI E-utilities."""
     if not ENABLE_NCBI_FALLBACK:
         return None
-    
+
     try:
-        # Search for the gene using Ensembl ID
         search_url = f"{NCBI_EUTILS}/esearch.fcgi"
         params = {
             "db": "gene",
@@ -227,7 +210,7 @@ def get_ncbi_gene_id_from_ensembl(ensembl_id):
             "retmode": "json",
             "retmax": 1
         }
-        
+
         time.sleep(SLEEP_BETWEEN_NCBI)
         r = retry_get(search_url, params=params)
         if r and r.status_code == 200:
@@ -243,16 +226,15 @@ def get_gene_symbol_from_ncbi(ncbi_gene_id):
     """Get gene symbol from NCBI Gene using NCBI Gene ID."""
     if not ENABLE_NCBI_FALLBACK or not ncbi_gene_id:
         return None
-    
+
     try:
-        # Get gene details
         summary_url = f"{NCBI_EUTILS}/esummary.fcgi"
         params = {
             "db": "gene",
             "id": ncbi_gene_id,
             "retmode": "json"
         }
-        
+
         time.sleep(SLEEP_BETWEEN_NCBI)
         r = retry_get(summary_url, params=params)
         if r and r.status_code == 200:
@@ -267,26 +249,21 @@ def get_go_terms_from_ncbi(ncbi_gene_id):
     """Get GO terms from NCBI Gene using NCBI Gene ID."""
     if not ENABLE_NCBI_FALLBACK or not ncbi_gene_id:
         return []
-    
+
     try:
-        # Get gene details including GO terms
         summary_url = f"{NCBI_EUTILS}/esummary.fcgi"
         params = {
             "db": "gene",
             "id": ncbi_gene_id,
             "retmode": "json"
         }
-        
+
         time.sleep(SLEEP_BETWEEN_NCBI)
         r = retry_get(summary_url, params=params)
         if r and r.status_code == 200:
             data = r.json()
             result = data.get("result", {}).get(ncbi_gene_id, {})
-            
-            # Extract GO terms from various fields
             go_terms = []
-            
-            # Check for GO annotations in different fields
             for field in ["go_component", "go_function", "go_process"]:
                 if field in result:
                     terms = result[field]
@@ -297,7 +274,6 @@ def get_go_terms_from_ncbi(ncbi_gene_id):
                                 description = term.get("label", "")
                                 if go_id.startswith("GO:"):
                                     go_terms.append((go_id, description))
-            
             return go_terms
     except Exception:
         pass
@@ -341,6 +317,7 @@ def annotate_ensembl_ids(id_list):
             symbol = get_gene_symbol(enid)
         except Exception:
             symbol = None
+
         # another short delay before xrefs
         time.sleep(SLEEP_BETWEEN)
         gos = []
@@ -374,11 +351,11 @@ def annotate_ensembl_ids(id_list):
                 try:
                     uniprot_id = get_uniprot_id_from_ensembl(enid)
                 except Exception:
-                    pass
+                    uniprot_id = None
 
                 if uniprot_id:
                     annotation["_uniprot_fallback_used"] = True
-                    
+
                     # Try to get missing gene symbol from UniProt
                     if not symbol:
                         try:
@@ -413,11 +390,11 @@ def annotate_ensembl_ids(id_list):
                 try:
                     ncbi_gene_id = get_ncbi_gene_id_from_ensembl(enid)
                 except Exception:
-                    pass
+                    ncbi_gene_id = None
 
                 if ncbi_gene_id:
                     annotation["_ncbi_fallback_used"] = True
-                    
+
                     # Try to get missing gene symbol from NCBI
                     if not symbol:
                         try:
@@ -450,14 +427,14 @@ def annotate_ensembl_ids(id_list):
         if symbol:
             gene_symbols_seen.append(symbol)
 
-    # Count fallback usage
+    # Count fallback usage and clean up metadata flags
     uniprot_fallback_used = 0
     ncbi_fallback_used = 0
     uniprot_symbols_added = 0
     uniprot_go_terms_added = 0
     ncbi_symbols_added = 0
     ncbi_go_terms_added = 0
-    
+
     for annotation in annotations:
         if annotation.get("_uniprot_fallback_used"):
             uniprot_fallback_used += 1
@@ -568,6 +545,19 @@ def annotate():
         return jsonify({"error": "Annotation failed", "detail": str(e)}), 500
 
     return jsonify(result)
+
+# Serve index.html from project root
+@app.route("/", methods=["GET"])
+def home():
+    root = os.path.abspath(os.path.dirname(__file__) or ".")
+    index_path = os.path.join(root, "index.html")
+    if os.path.exists(index_path):
+        return send_from_directory(root, "index.html")
+    return jsonify({"error": "index.html not found"}), 404
+
+@app.route("/index.html", methods=["GET"])
+def index_html():
+    return home()
 
 # ----- CLI behavior: process file or run server -----
 if __name__ == "__main__":
