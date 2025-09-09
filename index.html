@@ -35,36 +35,14 @@
       font-size: 1.1rem;
       margin-bottom: 0.5em;
     }
-    .clock {
-      font-size: 2.6rem;
-      margin: 18px 0 0 0;
-      color: #0aa89e;
-      letter-spacing: 2px;
-    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>🚧 Under Development</h1>
-    <p>Our site is currently undergoing updates.<br>
-    We'll be back online in about an hour.</p>
-    <div class="clock" id="clock"></div>
+    <p>MY site is currently undergoing updates.<br>
+    We'll be back online soon. Please show patience.</p>
     <p style="color:#888;font-size:0.95em;margin-top:22px;">Thank you for your patience!</p>
   </div>
-  <script>
-    // Optional: Countdown clock for 1 hour
-    const clock = document.getElementById('clock');
-    const target = new Date(Date.now() + 60*60*1000); // 1 hour from now
-    function updateClock() {
-      const now = new Date();
-      let diff = Math.max(0, target - now);
-      const mins = Math.floor(diff / 60000);
-      const secs = Math.floor((diff % 60000) / 1000);
-      clock.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')} remaining`;
-      if (diff > 0) setTimeout(updateClock, 1000);
-      else clock.textContent = "Back soon!";
-    }
-    updateClock();
-  </script>
 </body>
 </html>
