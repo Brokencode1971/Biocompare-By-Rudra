@@ -56,18 +56,12 @@ def retry_get(url, params=None, headers=HEADERS, max_tries=MAX_RETRIES):
             backoff *= 2
     raise RuntimeError(f"Failed to GET {url} after {max_tries} attempts")
 
-def retry_post(url, data=None, headers=HEADERS, json_body=False, max_tries=MAX_RETRIES):
-    """
-    retry_post supports sending either form/raw data (data param) or JSON body (if json_body=True).
-    """
+def retry_post(url, data=None, headers=HEADERS, max_tries=MAX_RETRIES):
     backoff = 1.0
     for attempt in range(max_tries):
         try:
-            if json_body:
-                r = requests.post(url, json=data, headers=headers, timeout=30)
-            else:
-                r = requests.post(url, data=data, headers=headers, timeout=30)
-            if r.status_code in (200, 201):
+            r = requests.post(url, data=data, headers=headers, timeout=30)
+            if r.status_code == 200:
                 return r
             # rate-limited or service unavailable -> backoff and retry
             if r.status_code in (429, 503):
@@ -117,115 +111,36 @@ def get_go_xrefs(ensembl_id):
     return gos
 
 # ----- UniProt helpers -----
-def _uniprot_poll_job(job_id, timeout=15.0):
-    """
-    Poll UniProt idmapping job status until finished or timeout (seconds).
-    Return True if finished successfully, False otherwise.
-    """
-    status_url = f"{UNIPROT_REST}/idmapping/status/{job_id}"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            r = retry_get(status_url)
-            if not r or r.status_code != 200:
-                time.sleep(SLEEP_BETWEEN_UNIPROT)
-                continue
-            j = r.json()
-            # different key names across versions: try common ones
-            status_val = j.get("jobStatus") or j.get("status") or j.get("job_status")
-            if isinstance(status_val, str):
-                status_val = status_val.lower()
-            if status_val in ("finished", "complete", "success"):
-                return True
-            if status_val in ("failed", "error"):
-                return False
-        except Exception:
-            pass
-        time.sleep(SLEEP_BETWEEN_UNIPROT)
-    return False
-
-def _uniprot_get_mapping_results(job_id, size=10):
-    """
-    Get mapping results for job_id. Return a list of result dicts (may be empty).
-    """
-    results_url = f"{UNIPROT_REST}/idmapping/results/{job_id}"
-    try:
-        r = retry_get(results_url, params={"format": "json", "size": size})
-        if r and r.status_code == 200:
-            j = r.json()
-            # results can appear under different keys; try common patterns
-            for key in ("results", "mappedResults", "data", "records"):
-                if key in j and isinstance(j[key], list):
-                    return j[key]
-            # fallback: entire payload may be a list
-            if isinstance(j, list):
-                return j
-    except Exception:
-        pass
-    return []
-
 def get_uniprot_id_from_ensembl(ensembl_id):
-    """
-    Map Ensembl gene ID to UniProt ID using UniProt idmapping endpoint (preferred),
-    with a fallback to search queries if idmapping fails.
-
-    Returns a single UniProt accession (string) or None.
-    """
-    if not ENABLE_UNIPROT_FALLBACK or not ensembl_id:
+    """Map Ensembl gene ID to UniProt ID using direct search."""
+    if not ENABLE_UNIPROT_FALLBACK:
         return None
 
-    # First try the idmapping API (preferred — more reliable)
-    try:
-        run_url = f"{UNIPROT_REST}/idmapping/run"
-        payload = {"from": "Ensembl", "to": "UniProtKB", "ids": ensembl_id}
-        # send JSON body
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        r = retry_post(run_url, data=payload, headers=headers, json_body=True)
-        if r and r.status_code in (200, 201):
-            j = r.json()
-            # job id can be under different keys depending on UniProt server version
-            job_id = j.get("jobId") or j.get("job_id") or j.get("id") or j.get("jobId")
-            if job_id:
-                # poll job until finished (small timeout)
-                finished = _uniprot_poll_job(job_id, timeout=12.0)
-                if finished:
-                    results = _uniprot_get_mapping_results(job_id, size=5)
-                    if results:
-                        # try several common shapes in returned items
-                        item = results[0]
-                        # many result items contain 'to' or 'to' / 'primaryAccession' / 'id'
-                        candidate = item.get("to") or item.get("primaryAccession") or item.get("id") or item.get("to")
-                        if candidate:
-                            return candidate
-    except Exception:
-        # swallow and fall back to search below
-        pass
-
-    # If idmapping didn't work, fall back to the older search heuristics (kept for compatibility)
+    # Try multiple search strategies
     search_queries = [
-        f"xref:Ensembl:{ensembl_id}",
-        f"xref:ensembl-{ensembl_id}",
         f"database:ensembl AND {ensembl_id}",
+        f"xref:ensembl-{ensembl_id}",
         f"gene:{ensembl_id}"
     ]
 
     for query in search_queries:
         try:
             url = f"{UNIPROT_REST}/uniprotkb/search"
-            params = {"query": query, "format": "json", "size": 1}
+            params = {
+                "query": query,
+                "format": "json",
+                "size": 1
+            }
+
             time.sleep(SLEEP_BETWEEN_UNIPROT)
             r = retry_get(url, params=params)
             if r and r.status_code == 200:
                 data = r.json()
-                results = data.get("results", []) or data.get("entries", [])
+                results = data.get("results", [])
                 if results:
-                    # try multiple possible keys for accession
-                    accession = results[0].get("primaryAccession") or results[0].get("accession") or results[0].get("id")
-                    if accession:
-                        return accession
+                    return results[0].get("primaryAccession")
         except Exception:
             continue
-
     return None
 
 def get_gene_symbol_from_uniprot(uniprot_id):
@@ -263,32 +178,18 @@ def get_go_terms_from_uniprot(uniprot_id):
         if r and r.status_code == 200:
             data = r.json()
             gos = []
-            cross_refs = data.get("uniProtKBCrossReferences", []) or data.get("dbReferences", [])
+            cross_refs = data.get("uniProtKBCrossReferences", [])
             for xref in cross_refs:
-                # different shapes: "database" or "type" keys
-                dbname = xref.get("database") or xref.get("type") or ""
-                if str(dbname).upper() == "GO":
-                    go_id = xref.get("id") or xref.get("properties", {}).get("GO") or None
-                    if not go_id:
-                        # older shape: properties list of dicts
-                        props = xref.get("properties", []) or []
-                        for p in props:
-                            if p.get("key") in ("GoTerm", "term", "name"):
-                                # skip: this is description, not id
-                                pass
-                        go_id = xref.get("id")
-                    if go_id and str(go_id).upper().startswith("GO:"):
+                if xref.get("database") == "GO":
+                    go_id = xref.get("id")
+                    if go_id and go_id.startswith("GO:"):
                         description = ""
-                        properties = xref.get("properties", []) or []
-                        # properties may be list of dicts {key,value}
+                        properties = xref.get("properties", [])
                         for prop in properties:
-                            if prop.get("key") == "GoTerm" or prop.get("key") == "term":
+                            if prop.get("key") == "GoTerm":
                                 description = prop.get("value", "")
                                 break
-                        # for some shapes description may be inside 'properties' as dict
-                        if not description and isinstance(xref.get("properties"), dict):
-                            description = xref["properties"].get("GoTerm") or xref["properties"].get("term", "")
-                        gos.append((str(go_id).strip(), description or ""))
+                        gos.append((go_id, description))
             return gos
     except Exception:
         pass
@@ -371,262 +272,233 @@ def get_go_terms_from_ncbi(ncbi_gene_id):
                             if isinstance(term, dict) and "value" in term:
                                 go_id = term["value"]
                                 description = term.get("label", "")
-                                if str(go_id).startswith("GO:"):
+                                if go_id.startswith("GO:"):
                                     go_terms.append((go_id, description))
             return go_terms
     except Exception:
         pass
     return []
 
-# small helpers for merging and formatting
-def _uniq_sorted(seq):
-    return sorted(list(dict.fromkeys(seq)))
+def is_annotation_complete(annotation):
+    """Check if annotation has both gene symbol and GO terms."""
+    has_symbol = bool(annotation.get("gene_symbol", "").strip())
+    has_go_terms = bool(annotation.get("go_ids", []))
+    return has_symbol and has_go_terms
 
-def merge_go_maps(*source_lists):
-    """
-    Accept multiple lists of (go_id, desc) tuples and return:
-      - set of unique GO IDs
-      - dict go_id -> set(descriptions)
-    """
-    ids = set()
-    desc_map = {}
-    for lst in source_lists:
-        if not lst:
-            continue
-        for gid, desc in lst:
-            if not gid:
-                continue
-            gid_up = str(gid).upper()
-            ids.add(gid_up)
-            if gid_up not in desc_map:
-                desc_map[gid_up] = set()
-            if desc and isinstance(desc, str) and desc.strip():
-                desc_map[gid_up].add(desc.strip())
-    return ids, desc_map
+def needs_fallback(annotation):
+    """Check if annotation needs UniProt fallback (missing symbol OR GO terms)."""
+    has_symbol = bool(annotation.get("gene_symbol", "").strip())
+    has_go_terms = bool(annotation.get("go_ids", []))
+    return not has_symbol or not has_go_terms
 
 # ----- core processing (no file I/O) -----
 def annotate_ensembl_ids(id_list):
     """
-    Accept list of Ensembl IDs and return a dict that preserves per-source data:
+    Accept list of Ensembl IDs and return a dict:
       {
-        "annotations": [
-           {
-             "ensembl_id": "...",
-             "sources": {
-                "ensembl": {"symbol": "...", "go": [ [id,desc], ... ]},
-                "uniprot":  {"id": "...", "symbol": "...", "go": [...]},
-                "ncbi":     {"id": "...", "symbol": "...", "go": [...]}
-             },
-             "merged": { "go_ids": [...], "go_descriptions": {goid: "desc1; desc2"} }
-           },
-           ...
-        ],
+        "annotations": [ {ensembl_id, gene_symbol, go_ids, go_terms}, ... ],
+        "gene_symbols": [...],
+        "go_ids": [...],
         "meta": {...}
       }
-
-    This function ALWAYS queries Ensembl, then UniProt (if enabled), then NCBI (if enabled),
-    and preserves each source's returned data for frontend comparison.
+    No files are written.
     """
     ids = [str(x).strip() for x in id_list if x and str(x).strip()]
     ids = ids[:MAX_IDS]  # truncate for safety
-
     annotations = []
-    gene_symbols_seen = set()
-    all_go_ids_global = set()
-
-    # track usage counts
-    uniprot_fetch_count = 0
-    ncbi_fetch_count = 0
+    gene_symbols_seen = []
+    all_go_ids = set()
 
     for enid in ids:
-        # Ensembl first
+        # small polite delay to avoid hammering Ensembl
         time.sleep(SLEEP_BETWEEN)
-        en_symbol = None
+        symbol = None
         try:
-            en_symbol = get_gene_symbol(enid)
+            symbol = get_gene_symbol(enid)
         except Exception:
-            en_symbol = None
+            symbol = None
 
+        # another short delay before xrefs
         time.sleep(SLEEP_BETWEEN)
-        en_gos = []
+        gos = []
         try:
-            en_gos = get_go_xrefs(enid) or []
+            gos = get_go_xrefs(enid)
         except Exception:
-            en_gos = []
+            gos = []
 
-        # UniProt (always attempt mapping/fetch if enabled)
-        up_id = None
-        up_symbol = None
-        up_gos = []
-        if ENABLE_UNIPROT_FALLBACK:
-            try:
-                up_id = get_uniprot_id_from_ensembl(enid)
-            except Exception:
-                up_id = None
+        go_ids = []
+        go_terms = []
+        for gid, desc in gos:
+            if isinstance(gid, str) and gid.upper().startswith("GO:"):
+                gid_up = gid.upper()
+                go_ids.append(gid_up)
+                go_terms.append(desc or "")
+                all_go_ids.add(gid_up)
 
-            if up_id:
-                uniprot_fetch_count += 1
-                time.sleep(SLEEP_BETWEEN_UNIPROT)
-                try:
-                    up_symbol = get_gene_symbol_from_uniprot(up_id)
-                except Exception:
-                    up_symbol = None
-                time.sleep(SLEEP_BETWEEN_UNIPROT)
-                try:
-                    up_gos = get_go_terms_from_uniprot(up_id) or []
-                except Exception:
-                    up_gos = []
-
-        # NCBI (always attempt mapping/fetch if enabled)
-        ncbi_id = None
-        ncbi_symbol = None
-        ncbi_gos = []
-        if ENABLE_NCBI_FALLBACK:
-            try:
-                ncbi_id = get_ncbi_gene_id_from_ensembl(enid)
-            except Exception:
-                ncbi_id = None
-
-            if ncbi_id:
-                ncbi_fetch_count += 1
-                time.sleep(SLEEP_BETWEEN_NCBI)
-                try:
-                    ncbi_symbol = get_gene_symbol_from_ncbi(ncbi_id)
-                except Exception:
-                    ncbi_symbol = None
-                time.sleep(SLEEP_BETWEEN_NCBI)
-                try:
-                    ncbi_gos = get_go_terms_from_ncbi(ncbi_id) or []
-                except Exception:
-                    ncbi_gos = []
-
-        # build per-source structures (preserve raw tuples)
-        source_ensembl = {
-            "symbol": en_symbol or "",
-            "go": [(str(gid).upper(), desc or "") for gid, desc in (en_gos or [])]
-        }
-        source_uniprot = {
-            "id": up_id or "",
-            "symbol": up_symbol or "",
-            "go": [(str(gid).upper(), desc or "") for gid, desc in (up_gos or [])]
-        }
-        source_ncbi = {
-            "id": ncbi_id or "",
-            "symbol": ncbi_symbol or "",
-            "go": [(str(gid).upper(), desc or "") for gid, desc in (ncbi_gos or [])]
-        }
-
-        # merge GO ids and descriptions across sources
-        merged_ids, merged_desc_map = merge_go_maps(source_ensembl["go"], source_uniprot["go"], source_ncbi["go"])
-        # add to global set
-        all_go_ids_global.update(merged_ids)
-
-        # build merged description strings (join multiple descriptions with '; ')
-        merged_desc_str = {gid: "; ".join(sorted(merged_desc_map.get(gid, []))) for gid in merged_desc_map}
-
-        # collect all symbols seen for global list
-        for s in (en_symbol, up_symbol, ncbi_symbol):
-            if s and isinstance(s, str) and s.strip():
-                gene_symbols_seen.add(s.strip())
-
+        # Create initial annotation
         annotation = {
             "ensembl_id": enid,
-            "sources": {
-                "ensembl": source_ensembl,
-                "uniprot": source_uniprot,
-                "ncbi": source_ncbi
-            },
-            "merged": {
-                "go_ids": sorted(merged_ids),
-                "go_descriptions": merged_desc_str
-            }
+            "gene_symbol": symbol or "",
+            "go_ids": go_ids,
+            "go_terms": go_terms
         }
 
-        annotations.append(annotation)
+        # Check if we need fallback
+        if needs_fallback(annotation):
+            # Try UniProt first
+            if ENABLE_UNIPROT_FALLBACK:
+                uniprot_id = None
+                try:
+                    uniprot_id = get_uniprot_id_from_ensembl(enid)
+                except Exception:
+                    uniprot_id = None
 
-    # build meta
+                if uniprot_id:
+                    annotation["_uniprot_fallback_used"] = True
+
+                    # Try to get missing gene symbol from UniProt
+                    if not symbol:
+                        try:
+                            uniprot_symbol = get_gene_symbol_from_uniprot(uniprot_id)
+                            if uniprot_symbol:
+                                annotation["gene_symbol"] = uniprot_symbol
+                                annotation["_uniprot_symbol_added"] = True
+                                symbol = uniprot_symbol
+                        except Exception:
+                            pass
+
+                    # Try to get missing GO terms from UniProt
+                    if not go_ids:
+                        try:
+                            uniprot_gos = get_go_terms_from_uniprot(uniprot_id)
+                            if uniprot_gos:
+                                annotation["_uniprot_go_added"] = True
+                            for gid, desc in uniprot_gos:
+                                if isinstance(gid, str) and gid.upper().startswith("GO:"):
+                                    gid_up = gid.upper()
+                                    go_ids.append(gid_up)
+                                    go_terms.append(desc or "")
+                                    all_go_ids.add(gid_up)
+                            annotation["go_ids"] = go_ids
+                            annotation["go_terms"] = go_terms
+                        except Exception:
+                            pass
+
+            # Try NCBI Gene as second fallback if still incomplete
+            if ENABLE_NCBI_FALLBACK and needs_fallback(annotation):
+                ncbi_gene_id = None
+                try:
+                    ncbi_gene_id = get_ncbi_gene_id_from_ensembl(enid)
+                except Exception:
+                    ncbi_gene_id = None
+
+                if ncbi_gene_id:
+                    annotation["_ncbi_fallback_used"] = True
+
+                    # Try to get missing gene symbol from NCBI
+                    if not symbol:
+                        try:
+                            ncbi_symbol = get_gene_symbol_from_ncbi(ncbi_gene_id)
+                            if ncbi_symbol:
+                                annotation["gene_symbol"] = ncbi_symbol
+                                annotation["_ncbi_symbol_added"] = True
+                                symbol = ncbi_symbol
+                        except Exception:
+                            pass
+
+                    # Try to get missing GO terms from NCBI
+                    if not go_ids:
+                        try:
+                            ncbi_gos = get_go_terms_from_ncbi(ncbi_gene_id)
+                            if ncbi_gos:
+                                annotation["_ncbi_go_added"] = True
+                            for gid, desc in ncbi_gos:
+                                if isinstance(gid, str) and gid.upper().startswith("GO:"):
+                                    gid_up = gid.upper()
+                                    go_ids.append(gid_up)
+                                    go_terms.append(desc or "")
+                                    all_go_ids.add(gid_up)
+                            annotation["go_ids"] = go_ids
+                            annotation["go_terms"] = go_terms
+                        except Exception:
+                            pass
+
+        annotations.append(annotation)
+        if symbol:
+            gene_symbols_seen.append(symbol)
+
+    # Count fallback usage and clean up metadata flags
+    uniprot_fallback_used = 0
+    ncbi_fallback_used = 0
+    uniprot_symbols_added = 0
+    uniprot_go_terms_added = 0
+    ncbi_symbols_added = 0
+    ncbi_go_terms_added = 0
+
+    for annotation in annotations:
+        if annotation.get("_uniprot_fallback_used"):
+            uniprot_fallback_used += 1
+        if annotation.get("_ncbi_fallback_used"):
+            ncbi_fallback_used += 1
+        if annotation.get("_uniprot_symbol_added"):
+            uniprot_symbols_added += 1
+        if annotation.get("_uniprot_go_added"):
+            uniprot_go_terms_added += 1
+        if annotation.get("_ncbi_symbol_added"):
+            ncbi_symbols_added += 1
+        if annotation.get("_ncbi_go_added"):
+            ncbi_go_terms_added += 1
+        # Clean up metadata fields from final output
+        annotation.pop("_uniprot_fallback_used", None)
+        annotation.pop("_ncbi_fallback_used", None)
+        annotation.pop("_uniprot_symbol_added", None)
+        annotation.pop("_uniprot_go_added", None)
+        annotation.pop("_ncbi_symbol_added", None)
+        annotation.pop("_ncbi_go_added", None)
+
     result = {
         "annotations": annotations,
-        "gene_symbols": sorted(gene_symbols_seen),
-        "go_ids": sorted(all_go_ids_global),
+        "gene_symbols": sorted({s for s in gene_symbols_seen if s}),
+        "go_ids": sorted(all_go_ids),
         "meta": {
             "version": VERSION,
             "count_input": len(id_list),
             "count_processed": len(ids),
             "timestamp": datetime.utcnow().isoformat() + "Z",
-            "uniprot": {
+            "uniprot_fallback": {
                 "enabled": ENABLE_UNIPROT_FALLBACK,
-                "fetch_count": uniprot_fetch_count
+                "fallback_used_count": uniprot_fallback_used,
+                "symbols_added_from_uniprot": uniprot_symbols_added,
+                "go_terms_added_from_uniprot": uniprot_go_terms_added
             },
-            "ncbi": {
+            "ncbi_fallback": {
                 "enabled": ENABLE_NCBI_FALLBACK,
-                "fetch_count": ncbi_fetch_count
+                "fallback_used_count": ncbi_fallback_used,
+                "symbols_added_from_ncbi": ncbi_symbols_added,
+                "go_terms_added_from_ncbi": ncbi_go_terms_added
             }
         }
     }
-
     return result
 
-# End of first half (endpoints and CLI runner will come in second half)
-# ----- HTTP endpoints (second half) -----
+# ----- HTTP endpoints -----
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"})
-
 
 @app.route("/version", methods=["GET"])
 def version():
     return jsonify({"version": VERSION, "started": datetime.utcnow().isoformat() + "Z"})
 
-
 @app.route("/config", methods=["GET"])
 def config():
     return jsonify({
         "uniprot_fallback_enabled": ENABLE_UNIPROT_FALLBACK,
-        "ncbi_fallback_enabled": ENABLE_NCBI_FALLBACK,
         "max_ids": MAX_IDS,
         "ensembl_rest_url": ENSEMBL_REST,
         "uniprot_rest_url": UNIPROT_REST,
         "version": VERSION
     })
-
-
-def _choose_preferred_symbol(sources):
-    """Prefer Ensembl symbol, then UniProt, then NCBI; fall back to empty string."""
-    for key in ("ensembl", "uniprot", "ncbi"):
-        val = sources.get(key, {}).get("symbol")
-        if val and isinstance(val, str) and val.strip():
-            return val.strip()
-    return ""
-
-
-def _build_compat_annotation(ann):
-    """
-    Convert the new per-source annotation into a compatibility shape the frontend expects.
-    Keeps the detailed `sources` and `merged` objects, and adds:
-      - gene_symbol (best available)
-      - go_ids (merged list)
-      - go_terms (parallel list of descriptions for each go_id)
-    """
-    compat = dict(ann)  # shallow copy
-    sources = ann.get("sources", {})
-    merged = ann.get("merged", {})
-
-    # preferred single symbol (for legacy frontend)
-    gene_symbol = _choose_preferred_symbol(sources)
-    compat["gene_symbol"] = gene_symbol
-
-    # go_ids: use merged go_ids (already sorted in annotate_ensembl_ids)
-    merged_ids = merged.get("go_ids", []) or []
-    compat["go_ids"] = merged_ids
-
-    # go_terms: build parallel array (may be empty strings)
-    desc_map = merged.get("go_descriptions", {}) or {}
-    go_terms = [desc_map.get(gid, "") for gid in merged_ids]
-    compat["go_terms"] = go_terms
-
-    return compat
-
 
 @app.route("/annotate", methods=["POST", "GET"])
 def annotate():
@@ -634,7 +506,7 @@ def annotate():
     Accepts:
       - POST JSON: { "ids": ["ENSG...","ENSG..."] }  OR  { "id1":"...", "id2":"..." }
       - GET    : /annotate?id1=...&id2=...
-    Returns JSON with per-source data plus compatibility fields for the frontend.
+    Returns JSON with whatever annotation data is computed.
     """
     ids = []
     if request.method == "POST":
@@ -652,7 +524,6 @@ def annotate():
                     ids.append(id1)
                 if id2:
                     ids.append(id2)
-
     # GET fallback
     if not ids:
         id1 = request.args.get("id1") or request.args.get("ensembl1")
@@ -673,17 +544,7 @@ def annotate():
     except Exception as e:
         return jsonify({"error": "Annotation failed", "detail": str(e)}), 500
 
-    # Build compatibility view expected by the frontend:
-    # - keep `annotations` but add top-level gene_symbol, go_ids, go_terms to each annotation
-    compat_annotations = []
-    for ann in result.get("annotations", []):
-        compat_annotations.append(_build_compat_annotation(ann))
-
-    compat_result = dict(result)  # shallow copy of meta/gene_symbols/go_ids
-    compat_result["annotations"] = compat_annotations
-
-    return jsonify(compat_result)
-
+    return jsonify(result)
 
 # Serve index.html from project root
 @app.route("/", methods=["GET"])
@@ -694,15 +555,13 @@ def home():
         return send_from_directory(root, "index.html")
     return jsonify({"error": "index.html not found"}), 404
 
-
 @app.route("/index.html", methods=["GET"])
 def index_html():
     return home()
 
-
 # ----- CLI behavior: process file or run server -----
 if __name__ == "__main__":
-    # legacy CLI mode: python ensembl.py some_ids.txt
+    # legacy CLI mode: `python ensembl.py some_ids.txt`
     if len(sys.argv) == 2 and os.path.exists(sys.argv[1]):
         path = sys.argv[1]
         with open(path, "r", encoding="utf-8") as fh:
@@ -714,3 +573,4 @@ if __name__ == "__main__":
     print(f"Starting Ensembl annotation server (no file output) on http://127.0.0.1:5000 — version {VERSION}")
     # debug=False by default; use an auto-reload dev loop externally if you want hot reload
     app.run(host="0.0.0.0", port=5000, debug=False)
+
