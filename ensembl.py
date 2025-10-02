@@ -309,5 +309,6 @@ if __name__ == "__main__":
         print(json.dumps(annotate_ensembl_ids(ids), indent=2))
     else:
         # Default server mode
-        print(f"Starting server version {VERSION} on https://dev-playground-8c4p.onrender.com")
+        print(f"Starting server version {VERSION} on https://biocompare-by-rudra.onrender.com")
         app.run(host="0.0.0.0", port=5000)
+
